@@ -64,7 +64,14 @@ def run_model(target_dir, model) -> dict:
         raise ValueError("No images found. Check your upload.")
 
     images = load_and_preprocess_images(image_names).to(device)
-    print(f"Preprocessed images shape: {images.shape}")
+    print(f"Preprocessed images shape: {images.shape}")      # (b, 3, 518, 518)
+    
+    # from matplotlib import pyplot as plt
+    # plt.imshow(images[0].squeeze().permute(1,2,0).cpu().numpy())
+    # plt.savefig("./sample.png")
+    
+    # print(images.shape)
+    
 
     # Run inference
     print("Running inference...")

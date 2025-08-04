@@ -21,10 +21,11 @@ import argparse
 from pathlib import Path
 import trimesh
 import pycolmap
+from matplotlib import pyplot as plt
 
 
 from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images_square
+from vggt.utils.load_fn import load_and_preprocess_images_square, load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
@@ -46,18 +47,18 @@ def parse_args():
     parser.add_argument("--use_ba", action="store_true", default=False, help="Use BA for reconstruction")
     ######### BA parameters #########
     parser.add_argument(
-        "--max_reproj_error", type=float, default=8.0, help="Maximum reprojection error for reconstruction"
+        "--max_reproj_error", type=float, default=20.0, help="Maximum reprojection error for reconstruction"   # original 8.0
     )
     parser.add_argument("--shared_camera", action="store_true", default=False, help="Use shared camera for all images")
     parser.add_argument("--camera_type", type=str, default="SIMPLE_PINHOLE", help="Camera type for reconstruction")
-    parser.add_argument("--vis_thresh", type=float, default=0.2, help="Visibility threshold for tracks")
-    parser.add_argument("--query_frame_num", type=int, default=8, help="Number of frames to query")
-    parser.add_argument("--max_query_pts", type=int, default=4096, help="Maximum number of query points")
+    parser.add_argument("--vis_thresh", type=float, default=0.15, help="Visibility threshold for tracks")    # original 0.2
+    parser.add_argument("--query_frame_num", type=int, default=8, help="Number of frames to query")    # original 8
+    parser.add_argument("--max_query_pts", type=int, default=50000, help="Maximum number of query points")   # original 4096
     parser.add_argument(
-        "--fine_tracking", action="store_true", default=True, help="Use fine tracking (slower but more accurate)"
+        "--fine_tracking", action="store_true", default=False, help="Use fine tracking (slower but more accurate)"   # original true
     )
     parser.add_argument(
-        "--conf_thres_value", type=float, default=5.0, help="Confidence threshold value for depth filtering (wo BA)"
+        "--conf_thres_value", type=float, default=1.0, help="Confidence threshold value for depth filtering (wo BA)"
     )
     return parser.parse_args()
 
@@ -70,10 +71,15 @@ def run_VGGT(model, images, dtype, resolution=518):
 
     # hard-coded to use 518 for VGGT
     images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
+    
+    torch.cuda.synchronize()  # Ensure warm-up is complete
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             images = images[None]  # add batch dimension
+            start_time.record()
             aggregated_tokens_list, ps_idx = model.aggregator(images)
 
         # Predict Cameras
@@ -82,6 +88,12 @@ def run_VGGT(model, images, dtype, resolution=518):
         extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
         # Predict Depth Maps
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+        end_time.record()
+        torch.cuda.synchronize()
+
+    runtime_ms = start_time.elapsed_time(end_time)  # Average time per run
+    runtime_sec = runtime_ms / 1000  # Convert ms to seconds
+    print(f"###### Time taken: {runtime_ms:.2f} ms ({runtime_sec:.4f} s)")
 
     extrinsic = extrinsic.squeeze(0).cpu().numpy()
     intrinsic = intrinsic.squeeze(0).cpu().numpy()
@@ -126,13 +138,24 @@ def demo_fn(args):
 
     # Load images and original coordinates
     # Load Image in 1024, while running VGGT with 518
-    vggt_fixed_resolution = 518
-    img_load_resolution = 1024
+    vggt_fixed_resolution = 518   #originally was 518
+    img_load_resolution = 518  #originally was 1024
 
-    images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)
+    # images = load_and_preprocess_images(image_path_list, img_load_resolution)
+    images, original_coords = load_and_preprocess_images_square(image_path_list, img_load_resolution)    # gives output of shape: (b, 3, 1024, 1024). Check to use load_and_preprocess_images()
     images = images.to(device)
     original_coords = original_coords.to(device)
-    print(f"Loaded {len(images)} images from {image_dir}")
+
+    plt.imshow(images[0].squeeze().permute(1,2,0).cpu().numpy())
+    plt.savefig("./sample.png")
+    
+    # print(images.shape)
+
+    # subsample = 50
+    # sample_idx = np.linspace(0, images.shape[0] -1, subsample, dtype=int)
+    
+    # images = images[sample_idx]
+    print(images.shape)
 
     # Run VGGT to estimate camera and depth
     # Run with 518x518 images
@@ -193,7 +216,7 @@ def demo_fn(args):
         reconstruction_resolution = img_load_resolution
     else:
         conf_thres_value = args.conf_thres_value
-        max_points_for_colmap = 100000  # randomly sample 3D points
+        max_points_for_colmap = 10000000  # randomly sample 3D points
         shared_camera = False  # in the feedforward manner, we do not support shared camera
         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
@@ -210,7 +233,7 @@ def demo_fn(args):
         points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
 
         conf_mask = depth_conf >= conf_thres_value
-        # at most writing 100000 3d points to colmap reconstruction object
+        # at most writing 10000000 3d points to colmap reconstruction object
         conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
 
         points_3d = points_3d[conf_mask]
