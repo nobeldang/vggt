@@ -60,7 +60,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images)   # (list, int-5). list of shape (b, s, p, 2c), int with starting patching index (usually 5)
 
         predictions = {}
 
