@@ -40,7 +40,35 @@ class MegaDepth_valid(BaseStereoViewDataset):
 
     def __len__(self):
         return len(self.scenes)
-    
+
+    def _get_single_view(self, view_idx, resolution):
+        """
+        Load and preprocess a single image using MegaDepth's metadata and cropping logic.
+        """
+        import os.path as osp
+
+        input_image_filename = osp.join(self.ROOT, view_idx)
+        input_rgb_image = imread_cv2(input_image_filename)
+
+        intrinsics = np.float32(self.metadata[view_idx].item()['intrinsic'])
+        camera_pose = np.linalg.inv(np.float32(self.metadata[view_idx].item()['pose']))  # cam2world
+
+        image, intrinsics = self._crop_resize_if_necessary(
+            input_rgb_image, intrinsics, resolution = resolution, rng=None, info=(self.ROOT, view_idx))
+        
+        image = self.transform(image)
+
+        image = (image + 1)/2   # to be between 0 and 1 for VGGT input
+        return dict(
+            img=image,
+            camera_pose=camera_pose,  # cam2world
+            camera_intrinsics=intrinsics,
+            dataset='MegaDepth',
+            label=self.ROOT,
+            instance=view_idx
+        )
+
+
     def _get_views(self, idx, resolution,  rng):
         """
         load data for megadepth_validation views
@@ -59,6 +87,7 @@ class MegaDepth_valid(BaseStereoViewDataset):
 
             image, intrinsics = self._crop_resize_if_necessary(
                 input_rgb_image, intrinsics, resolution, rng=rng, info=(self.ROOT, view_idx))
+            
             
             views.append(dict(
                 img=image,

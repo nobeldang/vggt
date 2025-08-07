@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import argparse
-from evaluation.datasets.megadepth_valid_pair import MegaDepth_valid
+from evaluation.datasets.megadepth_valid import MegaDepth_valid
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -317,9 +317,16 @@ def se3_to_relative_pose_error(pred_se3, gt_se3, num_frames):
 
     return rel_rangle_deg, rel_tangle_deg
 
+
 def test(args):
-    import random
-    from collections import defaultdict
+    from collections import OrderedDict
+    DATA_ROOT = args.data_root
+    NUM_FRAMES = 20  # must be even and <= number of unique images in file
+    SEED = 777
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    resolution = (518, 518)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -327,99 +334,295 @@ def test(args):
     # Load VGGT model
     model = load_vggt_model(device)
 
-    # Constants
-    DATA_ROOT = args.data_root
-    NUM_FRAMES = 100
-    SEED = 0
-
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-
     # Load metadata
     metadata = dict(np.load(os.path.join(DATA_ROOT, "megadepth_meta_test.npz"), allow_pickle=True))
 
-    # Group image paths by scene ID
+    # Read all pairs
     with open(os.path.join(DATA_ROOT, "megadepth_test_pairs.txt"), "r") as f:
-        lines = f.readlines()
+        lines = [line.strip().split() for line in f.readlines()]
 
-    scene_images = defaultdict(set)
-    for line in lines:
-        img1, img2 = line.strip().split()
-        for img in [img1, img2]:
-            scene_id = img.split('/')[1]  # e.g., '0015'
-            scene_images[scene_id].add(img)
+    num_batches = 2*len(lines) // NUM_FRAMES    # multiple by 2 because line has pair of images
+    print(f"Evaluating in {num_batches} batches of {NUM_FRAMES} images each")
 
-    auc_results = {}  # per scene
+    all_rerrs, all_terrs = [], []
 
-    for scene_id, img_list in scene_images.items():
-        if len(img_list) < NUM_FRAMES:
-            print(f"Skipping scene {scene_id} (not enough images: {len(img_list)})")
-            continue
+    for b in range(num_batches):
+        batch_imgs_pairs = lines[b * NUM_FRAMES//2: (b + 1) * NUM_FRAMES//2]
+        print(f"\n== Batch {b+1}/{num_batches}: {len(batch_imgs_pairs)*2} images ==")
 
-        print(f"\nProcessing scene {scene_id} with {len(img_list)} images")
+        # Use MegaDepth_valid's crop logic
+        from evaluation.datasets.megadepth_valid import MegaDepth_valid
+        dataset = MegaDepth_valid(resolution=resolution, seed=777)
+        batch_views = []
+        for [img_path1, img_path2]  in batch_imgs_pairs:
+            view1 = dataset._get_single_view(img_path1, resolution=resolution)
+            view2 = dataset._get_single_view(img_path2, resolution=resolution)
+            batch_views.append(view1)
+            batch_views.append(view2)
 
-        sampled_imgs = random.sample(list(img_list), NUM_FRAMES)
-        img_paths = [os.path.join(DATA_ROOT, img) for img in sampled_imgs]
-
-        # Load GT extrinsics (by default in world2cam)
-        gt_extrinsics = []
-        for img_rel_path in sampled_imgs:
-            pose_w2c = np.float32(metadata[img_rel_path].item()["pose"])  # in world2cam
-            gt_extrinsics.append(torch.tensor(pose_w2c[:3, :], dtype=torch.float64))
-        gt_extrinsics = torch.stack(gt_extrinsics, dim=0).to(device)   # in world2cam
-
-        # Convert to 4x4
+        # Stack images + poses
+        images = torch.stack([v['img'] for v in batch_views], dim=0).to(device)
+        gt_extrinsics = torch.stack([torch.tensor(v['camera_pose'][:3, :], dtype=torch.float64) for v in batch_views], dim=0).to(device)
         add_row = torch.tensor([0, 0, 0, 1], dtype=torch.float64, device=device).expand(NUM_FRAMES, 1, 4)
-        gt_se3_4x4 = torch.cat([gt_extrinsics, add_row], dim=1)
-        print("### gt shape: ", gt_se3_4x4.shape)
+        gt_se3 = closed_form_inverse_se3(gt_extrinsics)    # world2cam
 
-        # Load & preprocess images
-        images = load_and_preprocess_images(img_paths).to(device)
+        assert gt_se3.shape[-1] == 4, f"gt_se3 is not of shape 4" 
+        assert (images.shape[-2], images.shape[-1]) == resolution, f"image's res didnt match specified resolution"
 
-        print("### images.shape: ", images.shape)
-        for i in range(3):
-            plt.imshow(images[i].permute(1, 2, 0).cpu().numpy())
-            plt.show()
-            plt.savefig(f"./sample_{i}.png")
-            plt.close()
-        exit()
-        # Inference
+        # Run VGGT
         with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
             predictions = model(images)
         with torch.cuda.amp.autocast(dtype=torch.float64):
             pred_extrinsics, _ = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
             pred_extrinsics = pred_extrinsics[0]
+        pred_se3 = torch.cat([pred_extrinsics, add_row], dim=1)
 
-        pred_se3_4x4 = torch.cat([pred_extrinsics, add_row], dim=1)
+        assert pred_se3.shape[0] == NUM_FRAMES,f"Num frames mismatch with batched prediction"
 
-        del images
+        # Evaluate pairwise errors
+        r_err, t_err = se3_to_relative_pose_error(pred_se3, gt_se3, NUM_FRAMES)
+        all_rerrs.extend(r_err.cpu().numpy())
+        all_terrs.extend(t_err.cpu().numpy())
 
-        print("### pred.shape: ", pred_se3_4x4.shape)
+    # Final AUC scores
+    all_rerrs = np.array(all_rerrs)
+    all_terrs = np.array(all_terrs)
 
-        # Compute relative errors
-        r_err, t_err = se3_to_relative_pose_error(pred_se3_4x4, gt_se3_4x4, NUM_FRAMES)
-        del pred_se3_4x4, gt_se3_4x4
-        r_err_np = r_err.cpu().numpy()
-        t_err_np = t_err.cpu().numpy()
+    auc5, _ = calculate_auc_np(all_rerrs, all_terrs, max_threshold=5)
+    auc10, _ = calculate_auc_np(all_rerrs, all_terrs, max_threshold=10)
+    auc20, _ = calculate_auc_np(all_rerrs, all_terrs, max_threshold=20)
 
-        # AUCs
-        auc5, _ = calculate_auc_np(r_err_np, t_err_np, max_threshold=5)
-        auc10, _ = calculate_auc_np(r_err_np, t_err_np, max_threshold=10)
-        auc20, _ = calculate_auc_np(r_err_np, t_err_np, max_threshold=20)
+    print("\n===== Final AUC Scores =====")
+    print(f"AUC@5:  {auc5:.4f}")
+    print(f"AUC@10: {auc10:.4f}")
+    print(f"AUC@20: {auc20:.4f}")
 
-        auc_results[scene_id] = {
-            'auc@5': auc5,
-            'auc@10': auc10,
-            'auc@20': auc20,
-            'num_pairs': len(r_err_np)
-        }
+
+############################  WITH SORTING TRY AND INDIVIDUAL SCENE ###################
+# def test(args):
+#     import collections
+#     DATA_ROOT = args.data_root
+#     NUM_FRAMES = 100
+#     resolution = (518, 518)
+#     SEED = 777
+#     random.seed(SEED)
+#     np.random.seed(SEED)
+#     torch.manual_seed(SEED)
+
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+#     model = load_vggt_model(device)
+#     dataset = MegaDepth_valid(resolution=resolution, seed=777)
+#     metadata = dict(np.load(os.path.join(DATA_ROOT, "megadepth_meta_test.npz"), allow_pickle=True))
+
+#     # Read all pairs and group by scene
+#     with open(os.path.join(DATA_ROOT, "megadepth_test_pairs.txt"), "r") as f:
+#         lines = [line.strip().split() for line in f.readlines()]
+
+
+#     scene_pairs = collections.defaultdict(list)
+#     for img1, img2 in lines:
+#         scene_id = img1.split("/")[1]  # Use index 1 as per your note
+#         scene_pairs[scene_id].append((img1, img2))
+
+#     def build_pair_index_map(batch_img_list, pair_list):
+#         img_to_idx = {name: idx for idx, name in enumerate(batch_img_list)}
+#         return [(img_to_idx[i1], img_to_idx[i2]) for i1, i2 in pair_list if i1 in img_to_idx and i2 in img_to_idx]
+
+#     all_results = {}
+#     total_rerrs, total_terrs = [], [] 
+#     for scene_id, scene_lines in scene_pairs.items():
+#         seen = set()
+#         scene_images = []
+#         for i1, i2 in scene_lines:
+#             for img in [i1, i2]:
+#                 if img not in seen:
+#                     scene_images.append(img)
+#                     seen.add(img)
+        
+#         if len(scene_images) < NUM_FRAMES:
+#             print(f"Skipping scene {scene_id}: not enough images")
+#             continue
+
+#         print(f"\nProcessing scene {scene_id} with {len(scene_lines)} pairs and {len(scene_images)} unique images")
+
+#         rerrs, terrs, total_pairs = [], [], 0
+#         num_batches = len(scene_images) // NUM_FRAMES
+
+#         for b in range(num_batches):
+#             batch_imgs = scene_images[b * NUM_FRAMES: (b + 1) * NUM_FRAMES]
+#             batch_pairs = [(i1, i2) for i1, i2 in scene_lines if i1 in batch_imgs and i2 in batch_imgs]
+#             if not batch_pairs:
+#                 continue
+
+#             batch_views = [dataset._get_single_view(img, resolution=resolution) for img in batch_imgs]
+#             images = torch.stack([v['img'] for v in batch_views], dim=0).to(device)
+#             assert (images.shape[-2], images.shape[-1]) == resolution, f"Resolution of images didnt match the specifed resolution"
+#             gt_extrinsics = torch.stack(
+#                 [torch.tensor(v['camera_pose'][:3, :], dtype=torch.float64) for v in batch_views], dim=0).to(device)
+#             add_row = torch.tensor([0, 0, 0, 1], dtype=torch.float64, device=device).expand(len(batch_imgs), 1, 4)
+#             gt_se3 = torch.cat([gt_extrinsics, add_row], dim=1)
+#             gt_se3 = closed_form_inverse_se3(gt_se3)
+
+#             with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
+#                 predictions = model(images)
+#             with torch.cuda.amp.autocast(dtype=torch.float64):
+#                 pred_extrinsics, _ = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+#                 pred_extrinsics = pred_extrinsics[0]
+#             pred_se3 = torch.cat([pred_extrinsics, add_row], dim=1)
+
+#             pair_indices = build_pair_index_map(batch_imgs, batch_pairs)
+#             if not pair_indices:
+#                 continue
+
+#             total_pairs += len(pair_indices)
+#             i_s = np.array(pair_indices)[:, 0]
+#             j_s = np.array(pair_indices)[:, 1]
+
+#             relative_pose_gt = gt_se3[i_s].bmm(closed_form_inverse_se3(gt_se3[j_s]))
+#             relative_pose_pred = pred_se3[i_s].bmm(closed_form_inverse_se3(pred_se3[j_s]))
+
+#             rerrs.extend(rotation_angle(relative_pose_gt[:, :3, :3], relative_pose_pred[:, :3, :3]).cpu().numpy())
+#             terrs.extend(translation_angle(relative_pose_gt[:, :3, 3], relative_pose_pred[:, :3, 3]).cpu().numpy())
+
+#         if not rerrs:
+#             print(f"No valid pairs for scene {scene_id}")
+#             continue
+        
+#         total_rerrs.extend(rerrs)
+#         total_terrs.extend(terrs)
+#         rerrs, terrs = np.array(rerrs), np.array(terrs)
+#         print("###: rerrs.shape: ", rerrs.shape)
+#         auc5, _ = calculate_auc_np(rerrs, terrs, max_threshold=5)
+#         auc10, _ = calculate_auc_np(rerrs, terrs, max_threshold=10)
+#         auc20, _ = calculate_auc_np(rerrs, terrs, max_threshold=20)
+
+#         all_results[scene_id] = dict(
+#             auc5=auc5,
+#             auc10=auc10,
+#             auc20=auc20,
+#             num_pairs=total_pairs
+#         )
+    
+#     auc5, _ = calculate_auc_np(np.array(total_rerrs), np.array(total_terrs), max_threshold=5)
+#     auc10, _ = calculate_auc_np(np.array(total_rerrs), np.array(total_terrs),, max_threshold=10)
+#     auc20, _ = calculate_auc_np(np.array(total_rerrs), np.array(total_terrs), max_threshold=20)
+    
+#     print("\n========== Per-Scene AUC Results ==========\n")
+#     for scene_id, stats in all_results.items():
+#         print(f"Scene {scene_id}   AUC@5: {stats['auc5']:.4f}   AUC@10: {stats['auc10']:.4f}   AUC@20: {stats['auc20']:.4f}   (#Pairs: {stats['num_pairs']})")
+#     print("\n===========================================\n")
+
+#     print(f"Total combine AUC@5: {auc5}, AUC@10{auc10}, AUC@20{auc20}")
+
+
+
+
+
+# def test(args):
+#     import random
+#     from collections import defaultdict
+
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+#     # Load VGGT model
+#     model = load_vggt_model(device)
+
+#     # Constants
+#     DATA_ROOT = args.data_root
+#     NUM_FRAMES = 100
+#     SEED = 0
+
+#     random.seed(SEED)
+#     np.random.seed(SEED)
+#     torch.manual_seed(SEED)
+
+#     # Load metadata
+#     metadata = dict(np.load(os.path.join(DATA_ROOT, "megadepth_meta_test.npz"), allow_pickle=True))
+
+#     # Group image paths by scene ID
+#     with open(os.path.join(DATA_ROOT, "megadepth_test_pairs.txt"), "r") as f:
+#         lines = f.readlines()
+
+#     scene_images = defaultdict(set)
+#     for line in lines:
+#         img1, img2 = line.strip().split()
+#         for img in [img1, img2]:
+#             scene_id = img.split('/')[1]  # e.g., '0015'
+#             scene_images[scene_id].add(img)
+
+#     auc_results = {}  # per scene
+
+#     for scene_id, img_list in scene_images.items():
+#         if len(img_list) < NUM_FRAMES:
+#             print(f"Skipping scene {scene_id} (not enough images: {len(img_list)})")
+#             continue
+
+#         print(f"\nProcessing scene {scene_id} with {len(img_list)} images")
+
+#         sampled_imgs = random.sample(list(img_list), NUM_FRAMES)
+#         img_paths = [os.path.join(DATA_ROOT, img) for img in sampled_imgs]
+
+#         # Load GT extrinsics (by default in world2cam)
+#         gt_extrinsics = []
+#         for img_rel_path in sampled_imgs:
+#             pose_w2c = np.float32(metadata[img_rel_path].item()["pose"])  # in world2cam
+#             gt_extrinsics.append(torch.tensor(pose_w2c[:3, :], dtype=torch.float64))
+#         gt_extrinsics = torch.stack(gt_extrinsics, dim=0).to(device)   # in world2cam
+
+#         # Convert to 4x4
+#         add_row = torch.tensor([0, 0, 0, 1], dtype=torch.float64, device=device).expand(NUM_FRAMES, 1, 4)
+#         gt_se3_4x4 = torch.cat([gt_extrinsics, add_row], dim=1)
+#         print("### gt shape: ", gt_se3_4x4.shape)
+
+#         # Load & preprocess images
+#         images = load_and_preprocess_images(img_paths).to(device)
+
+#         print("### images.shape: ", images.shape)
+#         for i in range(3):
+#             plt.imshow(images[i].permute(1, 2, 0).cpu().numpy())
+#             plt.show()
+#             plt.savefig(f"./sample_{i}.png")
+#             plt.close()
+        
+#         # Inference
+#         with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
+#             predictions = model(images)
+#         with torch.cuda.amp.autocast(dtype=torch.float64):
+#             pred_extrinsics, _ = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+#             pred_extrinsics = pred_extrinsics[0]
+
+#         pred_se3_4x4 = torch.cat([pred_extrinsics, add_row], dim=1)
+
+#         del images
+
+#         print("### pred.shape: ", pred_se3_4x4.shape)
+
+#         # Compute relative errors
+#         r_err, t_err = se3_to_relative_pose_error(pred_se3_4x4, gt_se3_4x4, NUM_FRAMES)
+#         del pred_se3_4x4, gt_se3_4x4
+#         r_err_np = r_err.cpu().numpy()
+#         t_err_np = t_err.cpu().numpy()
+
+#         # AUCs
+#         auc5, _ = calculate_auc_np(r_err_np, t_err_np, max_threshold=5)
+#         auc10, _ = calculate_auc_np(r_err_np, t_err_np, max_threshold=10)
+#         auc20, _ = calculate_auc_np(r_err_np, t_err_np, max_threshold=20)
+
+#         auc_results[scene_id] = {
+#             'auc@5': auc5,
+#             'auc@10': auc10,
+#             'auc@20': auc20,
+#             'num_pairs': len(r_err_np)
+#         }
         
 
-    print("\n================ Scene-wise AUC Results ================\n")
-    for scene_id, stats in auc_results.items():
-        print(f"[Scene {scene_id}]   AUC@5: {stats['auc@5']:.4f}   AUC@10: {stats['auc@10']:.4f}   AUC@20: {stats['auc@20']:.4f}   (#Pairs: {stats['num_pairs']})")
-    print("\n========================================================\n")
+#     print("\n================ Scene-wise AUC Results ================\n")
+#     for scene_id, stats in auc_results.items():
+#         print(f"[Scene {scene_id}]   AUC@5: {stats['auc@5']:.4f}   AUC@10: {stats['auc@10']:.4f}   AUC@20: {stats['auc@20']:.4f}   (#Pairs: {stats['num_pairs']})")
+#     print("\n========================================================\n")
     
 
 

@@ -64,7 +64,8 @@ class BaseStereoViewDataset (EasyDataset):
             resolutions={resolutions_str},
             {self.transform=})""".replace('self.', '').replace('\n', '').replace('   ', '')
 
-    def _get_views(self, idx, resolution, rng):
+    
+    def _get_single_view(self, idx, resolution, rng):
         raise NotImplementedError()
 
     def __getitem__(self, idx):

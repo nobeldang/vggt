@@ -40,7 +40,7 @@ class MegaDepth_valid(BaseStereoViewDataset):
 
     def __len__(self):
         return len(self.scenes)
-    
+        
     def _get_views(self, idx, resolution,  rng):
         """
         load data for megadepth_validation views
