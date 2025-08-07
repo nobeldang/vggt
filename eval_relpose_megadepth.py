@@ -11,6 +11,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import closed_form_inverse_se3
 from vggt.utils.rotation import mat_to_quat
 import cv2
+from evaluation.ba import run_vggt_with_ba
 import matplotlib.pyplot as plt 
 
 def todevice(batch, device, callback=None, non_blocking=False):
@@ -109,6 +110,7 @@ def get_args_parser():
         default="MegaDepth_valid(resolution=(518,518), seed=777)")
     parser.add_argument('--batch_size', type=int,
         default=1)
+    parser.add_argument('--use_ba', action='store_true', default=False, help='Enable bundle adjustment')
     parser.add_argument('--data_root', type=str, default='./data/megadepth1500', 
         help='MegaDepth1500 dataset root')
     parser.add_argument('--num_workers', type=int,
@@ -323,6 +325,7 @@ def test(args):
     DATA_ROOT = args.data_root
     NUM_FRAMES = 20  # must be even and <= number of unique images in file
     SEED = 777
+    use_ba = args.use_ba
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -334,9 +337,6 @@ def test(args):
     # Load VGGT model
     model = load_vggt_model(device)
 
-    # Load metadata
-    metadata = dict(np.load(os.path.join(DATA_ROOT, "megadepth_meta_test.npz"), allow_pickle=True))
-
     # Read all pairs
     with open(os.path.join(DATA_ROOT, "megadepth_test_pairs.txt"), "r") as f:
         lines = [line.strip().split() for line in f.readlines()]
@@ -345,7 +345,7 @@ def test(args):
     print(f"Evaluating in {num_batches} batches of {NUM_FRAMES} images each")
 
     all_rerrs, all_terrs = [], []
-
+    image_names = None
     for b in range(num_batches):
         batch_imgs_pairs = lines[b * NUM_FRAMES//2: (b + 1) * NUM_FRAMES//2]
         print(f"\n== Batch {b+1}/{num_batches}: {len(batch_imgs_pairs)*2} images ==")
@@ -370,12 +370,27 @@ def test(args):
         assert (images.shape[-2], images.shape[-1]) == resolution, f"image's res didnt match specified resolution"
 
         # Run VGGT
-        with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
-        with torch.cuda.amp.autocast(dtype=torch.float64):
-            pred_extrinsics, _ = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
-            pred_extrinsics = pred_extrinsics[0]
-        pred_se3 = torch.cat([pred_extrinsics, add_row], dim=1)
+        
+        if use_ba:
+            try:
+                pred_extrinsic = run_vggt_with_ba(model, images, image_names=None, dtype=dtype)
+            except Exception as e:
+                print(f"BA failed with error: {e}. Falling back to standard VGGT inference.")
+                with torch.no_grad():
+                    with torch.cuda.amp.autocast(dtype=dtype):
+                        predictions = model(images)
+                with torch.cuda.amp.autocast(dtype=torch.float64):
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+                    pred_extrinsic = extrinsic[0]
+        else:
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    predictions = model(images)
+            with torch.cuda.amp.autocast(dtype=torch.float64):
+                extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+                pred_extrinsic = extrinsic[0]
+
+        pred_se3 = torch.cat([pred_extrinsic, add_row], dim=1)
 
         assert pred_se3.shape[0] == NUM_FRAMES,f"Num frames mismatch with batched prediction"
 
